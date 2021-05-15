@@ -1,0 +1,175 @@
+#!/bin/bash
+set -e
+
+# Instrucciones:
+#
+# Este script es Git pre-commit hook que verifica la ortografía de cualquier contenido que esté a punto de confirmar.
+#
+# Coloque este script en el directorio ".git /hooks/" de su repositorio. Debe llamarse "pre-commit" y ser
+# ejecutable. Un Git pre-commit solo funciona en un único repositorio. Necesita copiar este gancho en cada repositorio que desee
+# Úselo manualmente. Opcionalmente, puede configurar un enlace simbólico en el directorio ".git /hooks/" que apunte al script.
+#
+# Cada vez que intentas confirmar algo, este script se ejecuta y verifica la ortografía del contenido que estás confirmando.
+#
+# Si desea omitir el pre-commit de confirmación previa (aunque no se recomienda), puede confirmar con "git commit --no-verify".
+
+
+# El siguiente es un archivo de texto que representa su diccionario personalizado; editar según sea necesario. Agregue las palabras que desee
+# para ignorar para el corrector ortográfico.
+dict=~/.git-spell-check
+if [ ! -f $dict ]; then
+    touch ~/.git-spell-check
+    dict=~/.git-spell-check
+    printf "%s\n" "No se encontró el diccionario personalizado. Creado en ~/.git-spell-check..."
+fi
+
+
+# El siguiente es un diccionario temporal (un archivo binario) creado a partir del archivo de texto dict. Se elimina después de
+# finaliza el script.
+temp_dict=$(mktemp docs-dictionary-XXXXXX)
+
+# Idioma de validación del documento. Cuando utilice un idioma que no sea el inglés, asegúrese de tener las bibliotecas de ortografía adecuadas.
+lang=es
+
+# Defina una extensión para cualquier diccionario adicional (que contenga palabras que se ignoran durante la revisión ortográfica) que
+# se guardan localmente en su repositorio. Estos diccionarios se cargarán sobre el diccionario global existente 
+# de manera predeterminada es ~/.git-spell-check).
+extension=pws
+
+# Limpiar si el script se interrumpe o termina.
+trap "cleanup" SIGINT SIGTERM 
+
+# Prepara el diccionario desde cero en caso de que se hayan agregado nuevas palabras desde la última vez.
+function prepare_dictionary() {
+
+    local_dict=$(find . -name *.$extension -exec ls {} \;)
+    if [ -z "$local_dict" ]; then
+        sort -u $temp_dict -o $temp_dict
+        aspell --lang="$lang" create master "$temp_dict" < "$dict"
+    else
+        temp_file=$(mktemp temp_file-XXXXXX)
+        for file in $local_dict; do
+            cat $file >> $temp_file
+        done
+        cat $dict >> $temp_file
+        sort -u $temp_file -o $temp_file
+        aspell --lang="$lang" create master "$temp_dict" < "$temp_file"
+        /bin/rm -f "$temp_file"
+    fi
+
+}
+
+# Elimina el diccionario temporal.
+function cleanup() {
+
+    /bin/rm -f "$temp_dict"
+
+}
+
+# Revisa la ortografía del contenido que estás a punto de enviar. Escribe palabras mal escritas o en 0 (es decir, continúa con commit).
+function spell_check() {
+
+    words=$(git diff --cached | grep -e "^+[^+]" | aspell --mode=sgml list --add-sgml-skip={ulink,code,literal,firstname,parameter,option,package,replaceable,programlisting,userinput,screen,filename,command,computeroutput,abbrev,accel,orgname,surname,foreignphrase,acronym,hardware,keycap,systemitem,application} --lang="$lang" --extra-dicts="$temp_dict" | sort -u)
+    if [ ! "$words" ]; then
+        printf "%s\n" "No se encontraron errores tipográficos. Continuar con el commit..."
+        cleanup; exit 0
+    fi
+    printf "%s\n" "El corrector ortográfico falló en las siguientes palabras:
+-------------------------------------------------"
+    echo $words
+    for word in $words; do
+        grep --color=always --exclude-dir={.git,tmp} -HIrone "\<$word\>" $(git diff --cached --name-only --diff-filter=ACMRTUXB) | awk -F ":" '{print "Archivo: " $1 "\ton line: " $2 "\tPalabra: " $3}'
+        printf "%s\n" "-------------------"
+    done
+
+}
+
+# Agrega todas, algunas o ninguna de las palabras mal escritas al diccionario personalizado.
+function add_words_to_dict() {
+
+    printf "%s\n" "
+¿Deseas agregar alguna de las palabras mal escritas en su diccionario personalizado?
+  * a[ll]     (agregar todas las palabras en el diccionario, continúe con el commit)
+  * s[ome]    (agregar algunas palabras en el diccionario, arreglar otras, no hacer el commit)
+  * i[gnore]  (agregue algunas palabras en el diccionario, ignore el resto, continúe con el commit)
+  * n[one]    (no hacer el commit)
+"
+
+    while true; do
+        exec < /dev/tty # La simple lectura de la entrada del usuario no funciona porque los Git hooks tienen stdin separado.
+        read answer
+        shopt -s nocasematch
+        case "$answer" in
+            a|all)
+                add_all
+                cleanup; exit 0
+                ;;
+            s|some)
+                add_some
+                printf "%s\n" "Corrija los errores tipográficos restantes, use \"git add\" para agregar archivos 'fixed', y haga el commit."
+                cleanup; exit 1
+                ;;
+            i|ignore)
+                add_some
+                cleanup; exit 0
+                ;;
+            n|none)
+                add_none
+                cleanup; exit 1
+                ;;
+            *) 
+                printf "%s\n" "Respuesta incorrecta. Intentelo otra vez."
+                continue
+        esac
+        shopt -u nocasematch
+    done
+
+}
+
+# Agregar todas las palabras al diccionario personalizado y continúa con el commit.
+function add_all() {
+
+    for word in $words; do
+        echo $word >> "$dict"
+    done
+
+}
+
+# Agregar algunas palabras (seleccionadas por el usuario) al diccionario y salir con 1
+function add_some() {
+
+    for word in $words; do
+        printf "%s\n" "¿Desea agregar la siguiente palabra a su diccionario personalizado?: $word  (y[es] or n[o])"
+        while true; do
+            exec < /dev/tty
+            read answer
+            shopt -s nocasematch
+            case "$answer" in
+                y|yes)
+                    echo $word >> "$dict"
+                    printf "%s\n" "\"$word\" agregada a su diccionario personalizado."
+                    break ;;
+                n|no)
+                    break ;;
+                *) 
+                    printf "%s\n" "Respuesta incorrecta. Intentelo otra vez."
+                    continue
+            esac
+            shopt -u nocasematch
+        done
+    done
+
+}
+
+# No agregar ninguna de las palabras y salir con 1.
+function add_none() {
+
+    printf "%s\n" "No se agregaron palabras a su diccionario personalizado."
+    printf "%s\n" "Corrija los errores tipográficos restantes, use \"git add\" para agregar los archivos corregidos, y hacer commit."
+
+}
+
+
+prepare_dictionary
+spell_check
+add_words_to_dict
